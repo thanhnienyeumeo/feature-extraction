@@ -19,8 +19,9 @@ print('This script runs a sample anomaly detection (using simple autoencoder) '
 print('For more details, see this paper: Anomaly Detection for Insider Threats Using'
       ' Unsupervised Ensembles. Le, D. C.; and Zincir-Heywood, A. N. IEEE Transactions'
       ' on Network and Service Management, 18(2): 1152–1164. June 2021.')
-
-data = pd.read_pickle('week-r5.2-percentile30.pkl')
+import sys
+path = sys.argv[1]
+data = pd.read_pickle(path)
 removed_cols = ['user','day','week','starttime','endtime','sessionid','insider']
 x_cols = [i for i in data.columns if i not in removed_cols]
 
@@ -55,9 +56,24 @@ reconstructionError = paired_distances(xTest, ae.predict(xTest))
 
 print('AUC score: ', roc_auc_score(yTestBin, reconstructionError))
 
-print('Detection rate at different budgets:')
+print('\nMetrics at different budgets:')
+print('-' * 80)
 for ib in [0.001, 0.01, 0.05, 0.1, 0.2]:
     threshold = np.percentile(reconstructionError, 100-100*ib)
-    flagged = np.where(reconstructionError>threshold)[0]
-    dr = sum(yTestBin[flagged]>0)/sum(yTestBin>0)
-    print(f'{100*ib}%, DR = {100*dr:.2f}%')
+    predicted = reconstructionError > threshold
+    
+    # Calculate TP, FP, FN, TN
+    TP = np.sum((predicted == True) & (yTestBin == True))
+    FP = np.sum((predicted == True) & (yTestBin == False))
+    FN = np.sum((predicted == False) & (yTestBin == True))
+    TN = np.sum((predicted == False) & (yTestBin == False))
+    
+    # Calculate Precision, Recall, F1
+    precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+    recall = TP / (TP + FN) if (TP + FN) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    
+    print(f'Budget: {100*ib:.1f}%')
+    print(f'  TP={TP}, FP={FP}, FN={FN}, TN={TN}')
+    print(f'  Precision={precision:.4f}, Recall={recall:.4f}, F1={f1:.4f}')
+    print('-' * 80)

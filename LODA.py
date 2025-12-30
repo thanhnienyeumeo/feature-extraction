@@ -1,0 +1,189 @@
+#!/usr/bin/env python
+# coding: utf-8
+"""
+Anomaly Detection using Lightweight On-line Detector of Anomalies (LODA) - Supports CSV and PKL input
+
+This script can work with:
+1. Original CSV files (e.g., weekr4.2.csv, dayr4.2.csv)
+2. Pickle files with percentile transformation (e.g., week-r5.2-percentile30.pkl)
+
+Usage:
+    python LODA.py /path/to/weekr4.2.csv
+    python LODA.py /path/to/week-r5.2-percentile30.pkl
+"""
+
+import pandas as pd
+import numpy as np
+import sys
+from pyod.models.loda import LODA
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score
+
+print('=' * 80)
+print('Anomaly Detection using Lightweight On-line Detector of Anomalies (LODA)')
+print('Supports both CSV and PKL input files')
+print('=' * 80)
+
+# ============================================================================
+# STEP 1: Load data (CSV or PKL)
+# ============================================================================
+if len(sys.argv) < 2:
+    print("\nUsage: python LODA.py <path_to_data>")
+    print("Example: python LODA.py /home/user/r4.2/ExtractedData/weekr4.2.csv")
+    sys.exit(1)
+
+path = sys.argv[1]
+print(f'\nLoading data from: {path}')
+
+# Detect file type and load accordingly
+if path.endswith('.pkl') or path.endswith('.pickle'):
+    data = pd.read_pickle(path)
+    print(f'Loaded pickle file')
+elif path.endswith('.csv') or path.endswith('.csv.gz'):
+    data = pd.read_csv(path)
+    print(f'Loaded CSV file')
+else:
+    # Try CSV first, then pickle
+    try:
+        data = pd.read_csv(path)
+        print(f'Loaded as CSV file')
+    except:
+        data = pd.read_pickle(path)
+        print(f'Loaded as pickle file')
+
+print(f'Data shape: {data.shape[0]} rows, {data.shape[1]} columns')
+
+# ============================================================================
+# STEP 2: Identify feature columns vs metadata columns
+# ============================================================================
+# These columns should NOT be used as features (metadata/labels)
+removed_cols = [
+    'user', 'day', 'week', 'starttime', 'endtime', 'sessionid', 'insider',
+    'isweekday', 'isweekend',  # For day-level data
+    'role', 'b_unit', 'f_unit', 'dept', 'team', 'project',  # Categorical user info
+    'ITAdmin', 'O', 'C', 'E', 'A', 'N',  # User attributes
+]
+# removed_cols.extend([col for col in data.columns if 'afterhour' in col or 'weekend' in col])
+# Get feature columns (all numeric columns except removed ones)
+x_cols = [col for col in data.columns if col not in removed_cols]
+
+# Further filter to only numeric columns
+numeric_cols = data[x_cols].select_dtypes(include=[np.number]).columns.tolist()
+x_cols = numeric_cols
+
+print(f'\nUsing {len(x_cols)} features for anomaly detection')
+print(f'Sample features: {x_cols[:5]}...')
+
+# ============================================================================
+# STEP 3: Split data by time (first half = train, second half = test)
+# ============================================================================
+run = 1
+np.random.seed(run)
+
+max_week = data['week'].max()
+data1stHalf = data[data.week <= max_week / 2]
+dataTest = data[data.week > max_week / 2]
+
+print(f'\nTrain period: weeks 0-{int(max_week/2)} ({len(data1stHalf)} rows)')
+print(f'Test period: weeks {int(max_week/2)+1}-{int(max_week)} ({len(dataTest)} rows)')
+
+# ============================================================================
+# STEP 4: Select training users (200 random users)
+# ============================================================================
+all_train_users = list(set(data1stHalf.user))
+nUsers = np.random.permutation(all_train_users)
+trainUsers = nUsers[:min(200000, len(nUsers))]  # Use up to 200 users
+
+print(f'\nTraining on {len(trainUsers)} randomly selected users')
+
+# ============================================================================
+# STEP 5: Prepare training and test data
+# ============================================================================
+xTrain = data1stHalf[data1stHalf.user.isin(trainUsers)][x_cols].values
+yTrain = data1stHalf[data1stHalf.user.isin(trainUsers)]['insider'].values
+xTrain_not_insider = data1stHalf[data1stHalf['insider'] == 0]
+xTrain_not_insider = xTrain_not_insider[xTrain_not_insider.user.isin(trainUsers)]
+xTrain_not_insider = xTrain_not_insider[x_cols].values
+yTrainBin_not_insider = 0
+yTrainBin = yTrain > 0
+
+# Test on ALL data to get full picture
+xTest_all = data[x_cols].values
+yTest_all = data['insider'].values
+yTestBin_all = yTest_all > 0
+# Test on only second half
+xTest = dataTest[x_cols].values
+yTest = dataTest['insider'].values
+yTestBin = yTest > 0
+print(f'Training samples if insider in training: {len(xTrain)} (insiders in train: {yTrainBin.sum()})')
+print(f'Training samples if insider not in training: {len(xTrain_not_insider)} (not insiders in train)')
+print(f'Test samples: {len(xTest)} (total insiders: {yTestBin.sum()})')
+
+# Handle any NaN or infinite values
+xTrain = np.nan_to_num(xTrain, nan=0.0, posinf=0.0, neginf=0.0)
+xTrain_not_insider = np.nan_to_num(xTrain_not_insider, nan=0.0, posinf=0.0, neginf=0.0)
+xTest = np.nan_to_num(xTest, nan=0.0, posinf=0.0, neginf=0.0)
+
+# ============================================================================
+# STEP 6: Standardize features
+# ============================================================================
+print('\nStandardizing features...')
+scaler = StandardScaler()
+xTrain_not_insider = scaler.fit_transform(xTrain_not_insider)
+xTest = scaler.transform(xTest)
+
+# ============================================================================
+# STEP 7: Train LODA (Lightweight On-line Detector of Anomalies)
+# ============================================================================
+print('\n*****Training LODA (Lightweight On-line Detector of Anomalies)...')
+# LODA model parameters:
+# n_bins: number of bins for the histogram
+# n_random_cuts: number of random projections (cuts)
+loda = LODA(
+    contamination=0.1,  # Expected proportion of outliers
+    n_bins='auto',      # Number of bins for histogram
+    n_random_cuts=100   # Number of random projections
+)
+
+loda.fit(xTrain_not_insider)
+print('Training completed')
+
+# ============================================================================
+# STEP 8: Calculate anomaly scores
+# ============================================================================
+# Get anomaly scores (higher = more anomalous)
+print('\nCalculating anomaly scores...')
+anomaly_scores_not_insiders = loda.decision_function(xTest)
+
+# Do STEP 7 and STEP 8 again but with insider in training
+# Need to re-fit scaler for xTrain
+scaler_with_insider = StandardScaler()
+xTrain_scaled = scaler_with_insider.fit_transform(xTrain)
+xTest_scaled_with_insider = scaler_with_insider.transform(dataTest[x_cols].values)
+xTest_scaled_with_insider = np.nan_to_num(xTest_scaled_with_insider, nan=0.0, posinf=0.0, neginf=0.0)
+
+loda_with_insider = LODA(
+    contamination=0.1,
+    n_bins='auto',
+    n_random_cuts=100
+)
+loda_with_insider.fit(xTrain_scaled)
+print('Training completed for insider in training')
+anomaly_scores_insiders = loda_with_insider.decision_function(xTest_scaled_with_insider)
+
+# ============================================================================
+# STEP 9: Evaluate results
+# ============================================================================
+from utils import evaluate_results
+print('\n' + '=' * 80)
+print('LODA RESULTS FOR INSIDER IN TRAINING')
+print('=' * 80)
+
+evaluate_results(anomaly_scores_insiders, yTestBin)
+
+print('\n' + '=' * 80)
+print('LODA RESULTS FOR NOT INSIDER IN TRAINING')
+print('=' * 80)
+
+evaluate_results(anomaly_scores_not_insiders, yTestBin)
+
