@@ -196,57 +196,57 @@ print('=' * 80)
 evaluate_results(anomaly_scores_not_insiders, yTestBin)
 
 
-# STEP 10: Build MLP Regressor
-from sklearn.neural_network import MLPRegressor
-n_features = len(x_cols)
-hidden1 = max(10, 1 << (int(n_features / 4).bit_length()))  # Encoder
-hidden2 = max(5, 1 << (int(n_features / 8).bit_length()))   # Bottleneck
-hidden3 = max(10, 1 << (int(n_features / 4).bit_length()))  # Decoder
+# # STEP 10: Build MLP Regressor
+# from sklearn.neural_network import MLPRegressor
+# n_features = len(x_cols)
+# hidden1 = max(10, 1 << (int(n_features / 4).bit_length()))  # Encoder
+# hidden2 = max(5, 1 << (int(n_features / 8).bit_length()))   # Bottleneck
+# hidden3 = max(10, 1 << (int(n_features / 4).bit_length()))  # Decoder
 
-print(f'\nAutoencoder architecture: {n_features} → {hidden1} → {hidden2} → {hidden3} → {n_features}')
+# print(f'\nAutoencoder architecture: {n_features} → {hidden1} → {hidden2} → {hidden3} → {n_features}')
 
-ae = MLPRegressor(
-    hidden_layer_sizes=(hidden1, hidden2, hidden3),
-    max_iter=50,  # More iterations for better convergence
-    random_state=10,
-    early_stopping=True,  # Stop if validation score doesn't improve
-    validation_fraction=0.1,
-    verbose=False
-)
+# ae = MLPRegressor(
+#     hidden_layer_sizes=(hidden1, hidden2, hidden3),
+#     max_iter=50,  # More iterations for better convergence
+#     random_state=10,
+#     early_stopping=True,  # Stop if validation score doesn't improve
+#     validation_fraction=0.1,
+#     verbose=False
+# )
 
-print('*****Training autoencoder...')
-from sklearn.metrics.pairwise import paired_distances
-ae.fit(xTrain_not_insider, xTrain_not_insider)
-print('Training completed for MLP Regressor for insider not in training')
-anomaly_scores_not_insiders_mlp = ae.predict(xTest)
-anomaly_scores_not_insiders_mlp = paired_distances(xTest, anomaly_scores_not_insiders_mlp)
+# print('*****Training autoencoder...')
+# from sklearn.metrics.pairwise import paired_distances
+# ae.fit(xTrain_not_insider, xTrain_not_insider)
+# print('Training completed for MLP Regressor for insider not in training')
+# anomaly_scores_not_insiders_mlp = ae.predict(xTest)
+# anomaly_scores_not_insiders_mlp = paired_distances(xTest, anomaly_scores_not_insiders_mlp)
 
-ae = MLPRegressor(
-    hidden_layer_sizes=(hidden1, hidden2, hidden3),
-    max_iter=50,  # More iterations for better convergence
-    random_state=10,
-    early_stopping=True,  # Stop if validation score doesn't improve
-    validation_fraction=0.1,
-    verbose=False
-)
-ae.fit(xTrain_scaled, xTrain_scaled)
-print('Training completed for MLP Regressor for insider in training')
-anomaly_scores_insiders_mlp = ae.predict(xTest_scaled_with_insider)
-anomaly_scores_insiders_mlp = paired_distances(xTest_scaled_with_insider, anomaly_scores_insiders_mlp)
+# ae = MLPRegressor(
+#     hidden_layer_sizes=(hidden1, hidden2, hidden3),
+#     max_iter=50,  # More iterations for better convergence
+#     random_state=10,
+#     early_stopping=True,  # Stop if validation score doesn't improve
+#     validation_fraction=0.1,
+#     verbose=False
+# )
+# ae.fit(xTrain_scaled, xTrain_scaled)
+# print('Training completed for MLP Regressor for insider in training')
+# anomaly_scores_insiders_mlp = ae.predict(xTest_scaled_with_insider)
+# anomaly_scores_insiders_mlp = paired_distances(xTest_scaled_with_insider, anomaly_scores_insiders_mlp)
 
-# ============================================================================
-# STEP 11: Evaluate results
-# ============================================================================
+# # ============================================================================
+# # STEP 11: Evaluate results
+# # ============================================================================
 
-print('\n' + '=' * 80)
-print('RESULTS FOR INSIDER IN TRAINING')
-print('=' * 80)
+# print('\n' + '=' * 80)
+# print('RESULTS FOR INSIDER IN TRAINING')
+# print('=' * 80)
 
-evaluate_results(anomaly_scores_insiders_mlp, yTestBin)
+# evaluate_results(anomaly_scores_insiders_mlp, yTestBin)
 
-print('\n' + '=' * 80)
-print('RESULTS FOR INSIDER NOT IN TRAINING')
-print('=' * 80)
+# print('\n' + '=' * 80)
+# print('RESULTS FOR INSIDER NOT IN TRAINING')
+# print('=' * 80)
 
-# AUC Score
-evaluate_results(anomaly_scores_not_insiders_mlp, yTestBin)
+# # AUC Score
+# evaluate_results(anomaly_scores_not_insiders_mlp, yTestBin)
