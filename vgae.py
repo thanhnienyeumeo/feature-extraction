@@ -9,9 +9,15 @@ The VGAE learns to:
 2. Reconstruct the graph structure from latent representations
 
 Architecture:
+- Item Embedding: Learnable embeddings for each item (like SR-GNN)
 - Encoder: GCN-based encoder that outputs mean and log-variance
 - Decoder: Inner product decoder for graph reconstruction
 - Loss: Reconstruction loss + KL divergence
+
+Feature Options:
+1. Learnable item embeddings (recommended, 32-128 dim)
+2. Structural features (degree, position, centrality)
+3. Combined embeddings + structural features
 
 Reference:
 - Kipf & Welling, "Variational Graph Auto-Encoders", 2016
@@ -87,14 +93,23 @@ class VGAEEncoder(nn.Module):
     - First layer: shared feature extraction
     - Second layer: outputs mean (mu) and log-variance (logvar) for latent space
     """
-    def __init__(self, input_dim, hidden_dim, latent_dim):
+    def __init__(self, input_dim, hidden_dim, latent_dim, num_gcn_layers=2, dropout=0.0):
         super(VGAEEncoder, self).__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
+        self.num_gcn_layers = num_gcn_layers
+        self.dropout = dropout
         
-        # Shared GCN layer
-        self.gc1 = GraphConvolution(input_dim, hidden_dim)
+        # Build GCN layers
+        self.gcn_layers = nn.ModuleList()
+        
+        # First layer: input_dim -> hidden_dim
+        self.gcn_layers.append(GraphConvolution(input_dim, hidden_dim))
+        
+        # Additional hidden layers
+        for _ in range(num_gcn_layers - 2):
+            self.gcn_layers.append(GraphConvolution(hidden_dim, hidden_dim))
         
         # Mean and log-variance GCN layers
         self.gc_mu = GraphConvolution(hidden_dim, latent_dim)
@@ -112,8 +127,12 @@ class VGAEEncoder(nn.Module):
             mu: Mean of latent distribution [batch, n_nodes, latent_dim]
             logvar: Log-variance of latent distribution [batch, n_nodes, latent_dim]
         """
-        # Shared hidden representation
-        hidden = F.relu(self.gc1(x, adj))
+        # Pass through GCN layers
+        hidden = x
+        for gcn in self.gcn_layers:
+            hidden = F.relu(gcn(hidden, adj))
+            if self.dropout > 0:
+                hidden = F.dropout(hidden, p=self.dropout, training=self.training)
         
         # Mean and log-variance
         mu = self.gc_mu(hidden, adj)
@@ -151,30 +170,83 @@ class InnerProductDecoder(nn.Module):
 
 
 # ============================================================================
-# FULL VGAE MODEL
+# FULL VGAE MODEL WITH LEARNABLE EMBEDDINGS
 # ============================================================================
 
 class VGAE(nn.Module):
     """
-    Variational Graph Auto-Encoder for Session Data.
+    Variational Graph Auto-Encoder for Session Data with Learnable Item Embeddings.
+    
+    This model includes:
+    1. Learnable item embeddings (like SR-GNN) - captures item semantics
+    2. Optional structural features - captures graph structure
+    3. GCN encoder - processes graph structure
+    4. Inner product decoder - reconstructs adjacency
     
     Pipeline:
-    1. Encode session graph → latent distribution (mu, logvar)
-    2. Sample from latent distribution using reparameterization trick
-    3. Decode latent representation → reconstructed adjacency
+    1. Look up item embeddings + add structural features
+    2. Encode session graph → latent distribution (mu, logvar)
+    3. Sample from latent distribution using reparameterization trick
+    4. Decode latent representation → reconstructed adjacency
     
     Loss:
     - Reconstruction loss: BCE between original and reconstructed adjacency
     - KL divergence: regularization to keep latent space close to N(0,1)
+    
+    Recommended embedding_dim:
+    - Small datasets: 32-64
+    - Medium datasets: 64-128
+    - Large datasets: 128-256
     """
-    def __init__(self, input_dim, hidden_dim, latent_dim):
+    def __init__(self, n_items, embedding_dim=64, hidden_dim=64, latent_dim=32,
+                 num_gcn_layers=2, dropout=0.0, use_structural_features=True,
+                 structural_feature_dim=8):
+        """
+        Args:
+            n_items: Number of unique items in vocabulary
+            embedding_dim: Dimension of learnable item embeddings (default: 64)
+            hidden_dim: Hidden dimension for GCN layers (default: 64)
+            latent_dim: Latent dimension for VAE (default: 32)
+            num_gcn_layers: Number of GCN layers in encoder (default: 2)
+            dropout: Dropout rate (default: 0.0)
+            use_structural_features: Whether to add structural features (default: True)
+            structural_feature_dim: Dimension of structural feature projection (default: 8)
+        """
         super(VGAE, self).__init__()
-        self.input_dim = input_dim
+        self.n_items = n_items
+        self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
+        self.use_structural_features = use_structural_features
+        self.structural_feature_dim = structural_feature_dim
         
-        self.encoder = VGAEEncoder(input_dim, hidden_dim, latent_dim)
+        # Learnable item embeddings (like SR-GNN)
+        # +1 for padding token at index 0
+        self.item_embedding = nn.Embedding(n_items + 1, embedding_dim, padding_idx=0)
+        
+        # Structural feature projection (if used)
+        # Raw structural features: [in_degree, out_degree, position, frequency, ...]
+        self.n_structural_features = 6  # Number of raw structural features
+        if use_structural_features:
+            self.structural_proj = nn.Linear(self.n_structural_features, structural_feature_dim)
+            input_dim = embedding_dim + structural_feature_dim
+        else:
+            input_dim = embedding_dim
+        
+        self.input_dim = input_dim
+        
+        # Encoder and decoder
+        self.encoder = VGAEEncoder(input_dim, hidden_dim, latent_dim, num_gcn_layers, dropout)
         self.decoder = InnerProductDecoder()
+        
+        # Initialize weights
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        stdv = 1.0 / math.sqrt(self.embedding_dim)
+        self.item_embedding.weight.data.uniform_(-stdv, stdv)
+        # Set padding embedding to zeros
+        self.item_embedding.weight.data[0].fill_(0)
     
     def reparameterize(self, mu, logvar):
         """
@@ -189,19 +261,28 @@ class VGAE(nn.Module):
         else:
             return mu
     
-    def forward(self, x, adj):
+    def forward(self, item_ids, adj, structural_features=None):
         """
         Forward pass through VGAE.
         
         Args:
-            x: Node features [batch, n_nodes, input_dim]
+            item_ids: Item indices [batch, n_nodes] (LongTensor)
             adj: Normalized adjacency [batch, n_nodes, n_nodes]
+            structural_features: Optional structural features [batch, n_nodes, n_structural_features]
         
         Returns:
             adj_recon: Reconstructed adjacency [batch, n_nodes, n_nodes]
             mu: Latent mean [batch, n_nodes, latent_dim]
             logvar: Latent log-variance [batch, n_nodes, latent_dim]
         """
+        # Get item embeddings
+        x = self.item_embedding(item_ids)  # [batch, n_nodes, embedding_dim]
+        
+        # Add structural features if provided
+        if self.use_structural_features and structural_features is not None:
+            struct_emb = self.structural_proj(structural_features)  # [batch, n_nodes, structural_feature_dim]
+            x = torch.cat([x, struct_emb], dim=-1)  # [batch, n_nodes, embedding_dim + structural_feature_dim]
+        
         # Encode
         mu, logvar = self.encoder(x, adj)
         
@@ -213,41 +294,63 @@ class VGAE(nn.Module):
         
         return adj_recon, mu, logvar
     
-    def get_embedding(self, x, adj):
+    def get_embedding(self, item_ids, adj, structural_features=None, mask=None):
         """
         Get session embedding (use mean of latent distribution).
         
         For anomaly detection, we use the mean (mu) as the embedding.
         
         Args:
-            x: Node features [batch, n_nodes, input_dim]
+            item_ids: Item indices [batch, n_nodes]
             adj: Normalized adjacency [batch, n_nodes, n_nodes]
+            structural_features: Optional structural features [batch, n_nodes, n_structural_features]
+            mask: Node mask [batch, n_nodes] for proper averaging
         
         Returns:
             embedding: Session embedding [batch, latent_dim]
         """
+        # Get item embeddings
+        x = self.item_embedding(item_ids)
+        
+        # Add structural features if provided
+        if self.use_structural_features and structural_features is not None:
+            struct_emb = self.structural_proj(structural_features)
+            x = torch.cat([x, struct_emb], dim=-1)
+        
+        # Encode
         mu, _ = self.encoder(x, adj)
         
         # Aggregate node embeddings to get session embedding
-        # Option 1: Mean pooling over nodes
-        # Option 2: Sum pooling over nodes
-        # Option 3: Last node (for sequence)
-        # We use mean pooling
-        embedding = mu.mean(dim=-2)  # [batch, latent_dim]
+        if mask is not None:
+            # Masked mean pooling
+            mask_expanded = mask.unsqueeze(-1)  # [batch, n_nodes, 1]
+            sum_embeddings = (mu * mask_expanded).sum(dim=1)  # [batch, latent_dim]
+            count = mask.sum(dim=1, keepdim=True).clamp(min=1)  # [batch, 1]
+            embedding = sum_embeddings / count
+        else:
+            # Simple mean pooling
+            embedding = mu.mean(dim=1)  # [batch, latent_dim]
         
         return embedding
     
-    def get_node_embeddings(self, x, adj):
+    def get_node_embeddings(self, item_ids, adj, structural_features=None):
         """
         Get node-level embeddings (latent mean for each node).
         
         Args:
-            x: Node features [batch, n_nodes, input_dim]
+            item_ids: Item indices [batch, n_nodes]
             adj: Normalized adjacency [batch, n_nodes, n_nodes]
+            structural_features: Optional structural features
         
         Returns:
             mu: Node embeddings [batch, n_nodes, latent_dim]
         """
+        x = self.item_embedding(item_ids)
+        
+        if self.use_structural_features and structural_features is not None:
+            struct_emb = self.structural_proj(structural_features)
+            x = torch.cat([x, struct_emb], dim=-1)
+        
         mu, _ = self.encoder(x, adj)
         return mu
 
@@ -256,7 +359,64 @@ class VGAE(nn.Module):
 # SESSION GRAPH UTILITIES
 # ============================================================================
 
-def build_session_graph_for_vgae(session, n_items=None):
+def compute_structural_features(session, node_ids, node_to_idx, adj):
+    """
+    Compute structural features for each node in the session graph.
+    
+    Features:
+    1. In-degree (normalized)
+    2. Out-degree (normalized)
+    3. First position in session (normalized)
+    4. Last position in session (normalized)
+    5. Frequency in session (normalized)
+    6. Betweenness-like centrality (simplified)
+    
+    Args:
+        session: Original session sequence
+        node_ids: List of unique item ids
+        node_to_idx: Mapping from item id to node index
+        adj: Adjacency matrix (before normalization)
+    
+    Returns:
+        features: [n_nodes, 6] structural feature matrix
+    """
+    n_nodes = len(node_ids)
+    session_len = len(session)
+    
+    features = np.zeros((n_nodes, 6), dtype=np.float32)
+    
+    for i, item_id in enumerate(node_ids):
+        # Get positions of this item in session
+        positions = [pos for pos, item in enumerate(session) if item == item_id]
+        
+        # 1. In-degree (normalized by max possible)
+        in_degree = adj[:, i].sum() if adj.shape[0] > 0 else 0
+        features[i, 0] = in_degree / max(n_nodes - 1, 1)
+        
+        # 2. Out-degree (normalized)
+        out_degree = adj[i, :].sum() if adj.shape[1] > 0 else 0
+        features[i, 1] = out_degree / max(n_nodes - 1, 1)
+        
+        # 3. First position (normalized)
+        first_pos = positions[0] if positions else 0
+        features[i, 2] = first_pos / max(session_len - 1, 1)
+        
+        # 4. Last position (normalized)
+        last_pos = positions[-1] if positions else 0
+        features[i, 3] = last_pos / max(session_len - 1, 1)
+        
+        # 5. Frequency (normalized)
+        freq = len(positions)
+        features[i, 4] = freq / session_len
+        
+        # 6. Position spread (last - first, normalized) - indicates item importance
+        pos_spread = (last_pos - first_pos) / max(session_len - 1, 1) if positions else 0
+        features[i, 5] = pos_spread
+    
+    return features
+
+
+def build_session_graph_for_vgae(session, n_items=None, compute_structural=True):
     """
     Build a session graph from a sequence of items for VGAE.
     
@@ -266,16 +426,23 @@ def build_session_graph_for_vgae(session, n_items=None):
     
     Args:
         session: list of item indices
-        n_items: total number of items in vocabulary (for one-hot features)
+        n_items: total number of items in vocabulary
+        compute_structural: whether to compute structural features
     
     Returns:
-        node_features: [n_nodes, feature_dim] node feature matrix
-        adj: [n_nodes, n_nodes] normalized adjacency matrix
+        node_ids: [n_nodes] original item ids (for embedding lookup)
+        adj_normalized: [n_nodes, n_nodes] normalized adjacency matrix
         adj_label: [n_nodes, n_nodes] original adjacency (for reconstruction target)
-        node_ids: list of original item ids
+        structural_features: [n_nodes, 6] structural features (if compute_structural=True)
     """
-    # Get unique items
-    node_ids = list(set(session))
+    # Get unique items (preserve order of first appearance)
+    seen = set()
+    node_ids = []
+    for item in session:
+        if item not in seen:
+            seen.add(item)
+            node_ids.append(item)
+    
     node_to_idx = {node: idx for idx, node in enumerate(node_ids)}
     n_nodes = len(node_ids)
     
@@ -287,6 +454,11 @@ def build_session_graph_for_vgae(session, n_items=None):
         adj[u][v] = 1.0
         adj[v][u] = 1.0  # Make undirected for VGAE
     
+    # Compute structural features before normalization
+    structural_features = None
+    if compute_structural:
+        structural_features = compute_structural_features(session, node_ids, node_to_idx, adj)
+    
     # Add self-loops
     adj_with_self = adj + np.eye(n_nodes, dtype=np.float32)
     
@@ -297,75 +469,76 @@ def build_session_graph_for_vgae(session, n_items=None):
     D_inv_sqrt = np.diag(degree_inv_sqrt)
     adj_normalized = D_inv_sqrt @ adj_with_self @ D_inv_sqrt
     
-    # Node features: one-hot encoding based on position in session or item id
-    # Option 1: Use item id as feature (if n_items provided)
-    # Option 2: Use position encoding
-    # Option 3: Use degree as feature
-    # We'll use a combination of item id (scaled) and degree
-    if n_items is not None and n_items > 0:
-        # Normalized item id as feature
-        node_features = np.array([[node_ids[i] / n_items, degree[i] / n_nodes] 
-                                   for i in range(n_nodes)], dtype=np.float32)
-    else:
-        # Just use degree and node index
-        node_features = np.array([[i / n_nodes, degree[i] / n_nodes] 
-                                   for i in range(n_nodes)], dtype=np.float32)
-    
     # Adjacency label (original adjacency for reconstruction loss)
     adj_label = adj + np.eye(n_nodes, dtype=np.float32)  # Include self-loops in target
     
-    return node_features, adj_normalized, adj_label, node_ids
+    return node_ids, adj_normalized, adj_label, structural_features
 
 
-def process_sessions_for_vgae(sessions, n_items=None, max_nodes=None):
+def process_sessions_for_vgae(sessions, n_items=None, max_nodes=None, compute_structural=True):
     """
-    Process multiple sessions into batched format for VGAE.
+    Process multiple sessions into batched format for VGAE with learnable embeddings.
     
     Args:
         sessions: list of sessions
         n_items: total number of items
         max_nodes: maximum number of nodes (for padding)
+        compute_structural: whether to compute structural features
     
     Returns:
-        node_features: [batch, max_nodes, feature_dim]
+        item_ids: [batch, max_nodes] item indices for embedding lookup
         adj_normalized: [batch, max_nodes, max_nodes]
         adj_label: [batch, max_nodes, max_nodes]
+        structural_features: [batch, max_nodes, 6] or None
         masks: [batch, max_nodes] binary mask for valid nodes
     """
     batch_size = len(sessions)
     
     # Process each session
-    features_list = []
+    node_ids_list = []
     adj_norm_list = []
     adj_label_list = []
+    struct_feat_list = []
     n_nodes_list = []
     
     for session in sessions:
-        features, adj_norm, adj_label, _ = build_session_graph_for_vgae(session, n_items)
-        features_list.append(features)
+        node_ids, adj_norm, adj_label, struct_feat = build_session_graph_for_vgae(
+            session, n_items, compute_structural
+        )
+        node_ids_list.append(node_ids)
         adj_norm_list.append(adj_norm)
         adj_label_list.append(adj_label)
-        n_nodes_list.append(len(features))
+        struct_feat_list.append(struct_feat)
+        n_nodes_list.append(len(node_ids))
     
     # Find max nodes for padding
     if max_nodes is None:
         max_nodes = max(n_nodes_list)
     
-    feature_dim = features_list[0].shape[1]
-    
     # Create padded arrays
-    node_features = np.zeros((batch_size, max_nodes, feature_dim), dtype=np.float32)
+    item_ids = np.zeros((batch_size, max_nodes), dtype=np.int64)  # 0 is padding
     adj_normalized = np.zeros((batch_size, max_nodes, max_nodes), dtype=np.float32)
     adj_label = np.zeros((batch_size, max_nodes, max_nodes), dtype=np.float32)
     masks = np.zeros((batch_size, max_nodes), dtype=np.float32)
     
-    for i, (feat, adj_n, adj_l, n) in enumerate(zip(features_list, adj_norm_list, adj_label_list, n_nodes_list)):
-        node_features[i, :n, :] = feat
+    if compute_structural:
+        structural_features = np.zeros((batch_size, max_nodes, 6), dtype=np.float32)
+    else:
+        structural_features = None
+    
+    for i, (nids, adj_n, adj_l, struct_f, n) in enumerate(
+        zip(node_ids_list, adj_norm_list, adj_label_list, struct_feat_list, n_nodes_list)
+    ):
+        # Item ids (+1 to reserve 0 for padding)
+        item_ids[i, :n] = [nid + 1 for nid in nids]  # Shift by 1
         adj_normalized[i, :n, :n] = adj_n
         adj_label[i, :n, :n] = adj_l
         masks[i, :n] = 1.0
+        
+        if compute_structural and struct_f is not None:
+            structural_features[i, :n, :] = struct_f
     
-    return node_features, adj_normalized, adj_label, masks
+    return item_ids, adj_normalized, adj_label, structural_features, masks
 
 
 # ============================================================================
@@ -445,12 +618,13 @@ def trans_to_cpu(variable):
 
 class SessionDataset:
     """
-    Dataset class for session data.
+    Dataset class for session data with learnable embeddings.
     """
-    def __init__(self, sessions, n_items=None):
+    def __init__(self, sessions, n_items=None, compute_structural=True):
         self.sessions = sessions
         self.n_items = n_items
         self.n_sessions = len(sessions)
+        self.compute_structural = compute_structural
     
     def __len__(self):
         return self.n_sessions
@@ -458,11 +632,14 @@ class SessionDataset:
     def get_batch(self, batch_indices):
         """Get a batch of sessions."""
         batch_sessions = [self.sessions[i] for i in batch_indices]
-        return process_sessions_for_vgae(batch_sessions, self.n_items)
+        return process_sessions_for_vgae(
+            batch_sessions, self.n_items, compute_structural=self.compute_structural
+        )
 
 
 def train_vgae(model, train_sessions, n_items=None, epochs=50, batch_size=32, 
-               lr=0.001, beta=1.0, early_stopping_patience=10, verbose=True):
+               lr=0.001, beta=1.0, early_stopping_patience=10, verbose=True,
+               use_structural_features=True):
     """
     Train VGAE model on session data.
     
@@ -476,6 +653,7 @@ def train_vgae(model, train_sessions, n_items=None, epochs=50, batch_size=32,
         beta: KL divergence weight
         early_stopping_patience: patience for early stopping
         verbose: print training progress
+        use_structural_features: whether to use structural features
     
     Returns:
         model: trained model
@@ -484,7 +662,7 @@ def train_vgae(model, train_sessions, n_items=None, epochs=50, batch_size=32,
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
-    dataset = SessionDataset(train_sessions, n_items)
+    dataset = SessionDataset(train_sessions, n_items, compute_structural=use_structural_features)
     n_batches = (len(dataset) + batch_size - 1) // batch_size
     
     best_loss = float('inf')
@@ -505,17 +683,20 @@ def train_vgae(model, train_sessions, n_items=None, epochs=50, batch_size=32,
             batch_indices = indices[start_idx:end_idx]
             
             # Get batch data
-            node_features, adj_norm, adj_label, masks = dataset.get_batch(batch_indices)
+            item_ids, adj_norm, adj_label, structural_features, masks = dataset.get_batch(batch_indices)
             
             # Convert to tensors
-            node_features = trans_to_cuda(torch.FloatTensor(node_features))
+            item_ids = trans_to_cuda(torch.LongTensor(item_ids))
             adj_norm = trans_to_cuda(torch.FloatTensor(adj_norm))
             adj_label = trans_to_cuda(torch.FloatTensor(adj_label))
             masks = trans_to_cuda(torch.FloatTensor(masks))
             
+            if structural_features is not None:
+                structural_features = trans_to_cuda(torch.FloatTensor(structural_features))
+            
             # Forward pass
             optimizer.zero_grad()
-            adj_recon, mu, logvar = model(node_features, adj_norm)
+            adj_recon, mu, logvar = model(item_ids, adj_norm, structural_features)
             
             # Compute loss
             loss, recon_loss, kl_loss = vgae_loss(
@@ -557,7 +738,8 @@ def train_vgae(model, train_sessions, n_items=None, epochs=50, batch_size=32,
     return model, history
 
 
-def extract_vgae_embeddings(model, sessions, n_items=None, batch_size=100):
+def extract_vgae_embeddings(model, sessions, n_items=None, batch_size=100,
+                            use_structural_features=True):
     """
     Extract session embeddings from trained VGAE.
     
@@ -566,6 +748,7 @@ def extract_vgae_embeddings(model, sessions, n_items=None, batch_size=100):
         sessions: list of sessions
         n_items: total number of items
         batch_size: batch size for processing
+        use_structural_features: whether to use structural features
     
     Returns:
         embeddings: [n_sessions, latent_dim] session embeddings
@@ -583,22 +766,87 @@ def extract_vgae_embeddings(model, sessions, n_items=None, batch_size=100):
             batch_sessions = sessions[start_idx:end_idx]
             
             # Process sessions
-            node_features, adj_norm, _, masks = process_sessions_for_vgae(
-                batch_sessions, n_items
+            item_ids, adj_norm, _, structural_features, masks = process_sessions_for_vgae(
+                batch_sessions, n_items, compute_structural=use_structural_features
             )
             
             # Convert to tensors
-            node_features = trans_to_cuda(torch.FloatTensor(node_features))
+            item_ids = trans_to_cuda(torch.LongTensor(item_ids))
             adj_norm = trans_to_cuda(torch.FloatTensor(adj_norm))
             masks = trans_to_cuda(torch.FloatTensor(masks))
             
-            # Get embeddings
-            embeddings = model.get_embedding(node_features, adj_norm)
+            if structural_features is not None:
+                structural_features = trans_to_cuda(torch.FloatTensor(structural_features))
             
-            # Apply mask for proper mean (accounting for padding)
-            # Note: get_embedding already does mean pooling, but we could refine this
+            # Get embeddings with proper mask handling
+            embeddings = model.get_embedding(item_ids, adj_norm, structural_features, masks)
             
             embeddings = trans_to_cpu(embeddings).numpy()
             all_embeddings.append(embeddings)
     
     return np.concatenate(all_embeddings, axis=0)
+
+
+# ============================================================================
+# RECOMMENDED CONFIGURATIONS
+# ============================================================================
+
+def get_recommended_config(n_items, dataset_size='medium'):
+    """
+    Get recommended VGAE configuration based on dataset characteristics.
+    
+    Args:
+        n_items: Number of unique items in vocabulary
+        dataset_size: 'small' (<1000 sessions), 'medium' (1000-100000), 'large' (>100000)
+    
+    Returns:
+        config: Dictionary of recommended hyperparameters
+    """
+    configs = {
+        'small': {
+            'embedding_dim': 32,
+            'hidden_dim': 32,
+            'latent_dim': 16,
+            'num_gcn_layers': 2,
+            'dropout': 0.1,
+            'use_structural_features': True,
+            'structural_feature_dim': 8,
+            'batch_size': 16,
+            'epochs': 100,
+            'lr': 0.001,
+        },
+        'medium': {
+            'embedding_dim': 64,
+            'hidden_dim': 64,
+            'latent_dim': 32,
+            'num_gcn_layers': 2,
+            'dropout': 0.1,
+            'use_structural_features': True,
+            'structural_feature_dim': 16,
+            'batch_size': 32,
+            'epochs': 50,
+            'lr': 0.001,
+        },
+        'large': {
+            'embedding_dim': 128,
+            'hidden_dim': 128,
+            'latent_dim': 64,
+            'num_gcn_layers': 3,
+            'dropout': 0.2,
+            'use_structural_features': True,
+            'structural_feature_dim': 32,
+            'batch_size': 64,
+            'epochs': 30,
+            'lr': 0.0005,
+        }
+    }
+    
+    config = configs.get(dataset_size, configs['medium'])
+    
+    # Adjust embedding_dim based on n_items
+    if n_items > 10000:
+        config['embedding_dim'] = max(config['embedding_dim'], 128)
+    elif n_items > 1000:
+        config['embedding_dim'] = max(config['embedding_dim'], 64)
+    
+    return config
